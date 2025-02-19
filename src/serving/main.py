@@ -119,8 +119,24 @@ def score_metric_v3(throughput, itl_median):
     # This also negatively influences when the ITL is too low even if the throughput is higher which is what we really want. 
 
 def score_metric_v4(throughput, itl_median):
-    penalty = max(0, (itl_median - ITL_MEDIAN_CEILING) / ITL_MEDIAN_CEILING) ** 2
+    penalty = max(0, (itl_median - ITL_MEDIAN_CEILING) / ITL_MEDIAN_CEILING)
     return (throughput / 1000) * (1 - penalty)
+
+# Just letting it run with the values directly
+# This is a multi-objective scoring function
+def multi_objective_score_v1(throughput, itl_median):
+    return throughput, itl_median
+
+def multi_objective_score_v2(throughput, itl_median):
+    # Trying to bring them to the same scale
+    # ITL penalty is a quadratic function to penalize more as it moves further away from the ITL_MEDIAN_CEILING
+    itl_penalty = max(0, ((itl_median - ITL_MEDIAN_CEILING) / ITL_MEDIAN_CEILING)**2)
+    return throughput / 1000, itl_penalty
+
+# The next power of 2 greater than the current concurrency
+def get_next_max_concurrency_limit(concurrency):
+    return 2 ** (concurrency.bit_length())
+
 
 def objective(trial : optuna.Trial):
 
@@ -145,6 +161,10 @@ def objective(trial : optuna.Trial):
         # choices=[8]
         # )
     block_size = 16
+
+    # Concurrency
+    concurrency = trial.suggest_int("concurrency", low=32, high=512, step=4) # Step size of 4 to reduce the number of possible trials
+    max_seq_num = get_next_max_concurrency_limit(concurrency)
 
     log_folder_path = os.path.join(log_folder_path, trial.study.study_name, study_start_time) 
     if not os.path.exists(log_folder_path):
@@ -184,6 +204,9 @@ def objective(trial : optuna.Trial):
 
                     # "--enable-prefix-caching",
                     "--no-enable-prefix-caching",
+
+                    "--max-num-seqs",
+                    str(max_seq_num),
 
          
                     # "--num-scheduler-steps",
@@ -235,7 +258,7 @@ def objective(trial : optuna.Trial):
         if not os.path.exists(load_test_config["output"]["dir"]):
             os.makedirs(load_test_config["output"]["dir"])
         load_test_config["load_options"]["duration"] = 60 # TODO: Need a way to identify steady state
-        load_test_config["load_options"]["concurrency"] = trial.suggest_int("concurrency", low=32, high=512, step=1)
+        load_test_config["load_options"]["concurrency"] = concurrency
 
         # Write the config file to tmp with a random ID
         config_file_path = os.path.join(artifacts_dir, trial.study.study_name, study_start_time, make_file_name("config_", trial.params, ".yaml"))
@@ -281,7 +304,7 @@ def objective(trial : optuna.Trial):
 
         # Score the metric
         # score = score_metric(throughput, itl_median)
-        score = score_metric_v4(throughput, itl_median)
+        # score = score_metric_v4(throughput, itl_median)
 
         # Waiting for vLLM to timeout or finish
         try:
@@ -303,17 +326,18 @@ def objective(trial : optuna.Trial):
         trial.set_user_attr("config_file_path", config_file_path)
         # f.write(out)
 
-    return score
+    return multi_objective_score_v2(throughput, itl_median)
 
 optuna.logging.get_logger("optuna").addHandler(logging.StreamHandler(sys.stdout))
-study_name = "vllm-tune-single-param-SMv4" # Will need to be made more discrete. Possibly identify code changes to ensure we're comparing apples to apples
+study_name = "vllm-tune-multi-objective-v2" # Will need to be made more discrete. Possibly identify code changes to ensure we're comparing apples to apples
 storage_name = f"sqlite:////tmp/vllm-tune/{study_name}.db" # Save more information to the RDB to be accessed later, resume if needed
 
 study = optuna.create_study(
-    direction='maximize',
+    directions=['maximize', 'minimize'],
     study_name=study_name,
     storage=storage_name,
-    load_if_exists=True
+    load_if_exists=True,
+    sampler=optuna.samplers.NSGAIISampler()
 )
 
 study.set_user_attr("study_start_time",datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))
@@ -343,6 +367,16 @@ study.set_user_attr("artifacts_dir", "/tmp/vllm-tune/artifacts")
 # Why not use the existing Kruize org repos for this ? - They only seem to run the experiments and want manual intervention for the optimization (Choosing if the experiment was good or not)
 # This means it's easier to do subjective optimization but harder to do automated optimization
 
-study.optimize(objective, show_progress_bar=True, n_trials=10)
+study.optimize(objective, show_progress_bar=True, n_trials=20)
 
-study.trials_dataframe().to_csv("/tmp/vllm-tune/study.csv")
+# study.trials_dataframe().to_csv("/tmp/vllm-tune/study.csv")
+trials = sorted(study.best_trials, key = lambda trial: trial.values)
+print("Best Trials : ")
+for trial in trials:
+    print("Trial : ", trial.number)
+    print("Params : ", trial.params)
+    print("Value : ", trial.values)
+    print("Attributes : ", trial.user_attrs)
+    print("Intermediate Values : ", trial.intermediate_values)
+    print("Datetime : ", trial.datetime_start)
+study.trials_dataframe().to_csv("/tmp/vllm-tune/multi-objective-study.csv")
