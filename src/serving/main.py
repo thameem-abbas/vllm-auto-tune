@@ -324,6 +324,7 @@ def objective(trial : optuna.Trial):
         trial.set_user_attr("throughput", throughput)
         trial.set_user_attr("itl_median", itl_median)
         trial.set_user_attr("config_file_path", config_file_path)
+
         # f.write(out)
 
     return multi_objective_score_v2(throughput, itl_median)
@@ -343,6 +344,14 @@ study = optuna.create_study(
 study.set_user_attr("study_start_time",datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))
 study.set_user_attr("log_folder_path", "/tmp/vllm-tune/logs")
 study.set_user_attr("artifacts_dir", "/tmp/vllm-tune/artifacts")
+
+# Get GPU Properties
+# TODO: Extend to Multi-GPU Scenario
+import torch
+gpu_properties = torch.cuda.get_device_properties(0)
+study.set_user_attr("gpu_name", gpu_properties.name)
+study.set_user_attr("gpu_memory", gpu_properties.total_memory)
+        
 
 # Cannot run more than one job at this time
 # TODO: GPU Indexing for parallelizing the trials
