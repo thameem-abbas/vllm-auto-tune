@@ -1,0 +1,29 @@
+output:
+  format: "json" # Maybe add option for pickle?
+  dir: "./output/"
+  file: "output-{concurrency:03d}.json"
+storage: # TODO
+  type: local
+dataset:
+  file: "/root/thibrahi/vllm-auto-tune/llm-load-test/datasets/openorca_large_subset_011.jsonl"
+  max_queries: 3000
+  min_input_tokens: 0
+  max_input_tokens: 512
+  min_output_tokens: 0
+  max_output_tokens: 512
+  max_sequence_tokens: 1024 # system_prompt tokens not counted towards filters
+  custom_prompt_format: null # Sample : "{system_prompt}\n\n{prompt}""
+load_options:
+  type: constant #Future options: loadgen, stair-step
+  concurrency: [1,2,4,8,16,32] # can also be a list [1,2,4]
+  duration: 60 # In seconds. Maybe in future support "100s" "10m", etc...
+plugin: "openai_plugin"
+plugin_options:
+  use_tls: False # Use True if querying an SSL grpc endpoint over https
+  streaming: True
+  model_name: "trial"
+  host: "http://0.0.0.0:8000"
+  endpoint: "/v1/completions"
+  authorization: "" # Set if host requires Authorization Token
+extra_metadata:
+  replicas: 1
