@@ -152,18 +152,17 @@ def objective(trial : optuna.Trial):
         # choices=[True, False]
     # )
 
-    # num_scheduler_steps = trial.suggest_int("num-multi-steps", low=1, high=32, step=1)
+    num_scheduler_steps = trial.suggest_int("num-multi-steps", low=1, high=10, step=1)
 
-    # block_size = trial.suggest_categorical(
-        # "block_size",
+    block_size = trial.suggest_categorical(
+        "block_size",
         # choices=[8,16,32] # Opt250m doesn't support 64 and 128
-        # choices=[8,16,32,64,128]
+        choices=[8,16,32,64,128]
         # choices=[8]
-        # )
-    block_size = 16
+        )
 
     # Concurrency
-    concurrency = trial.suggest_int("concurrency", low=32, high=512, step=4) # Step size of 4 to reduce the number of possible trials
+    concurrency = trial.suggest_int("concurrency", low=32, high=256, step=4) # Step size of 4 to reduce the number of possible trials
     max_seq_num = get_next_max_concurrency_limit(concurrency)
 
     log_folder_path = os.path.join(log_folder_path, trial.study.study_name, study_start_time) 
@@ -190,10 +189,11 @@ def objective(trial : optuna.Trial):
                     "vllm",
                     "serve",
                     # "/mnt/data/models/Llama-3.2-3B",
-                    "/mnt/data/models/opt250m",
+                    # "/mnt/data/models/opt250m",
+                    "/home/ubuntu/thibrahi/vllm-auto-tune/llama-32-3b-instruct",
 
                     "--max-model-len",
-                    "1024",
+                    "2048",
                     
                     "--block-size",
                     str(block_size),
@@ -203,22 +203,23 @@ def objective(trial : optuna.Trial):
                     # "false",
 
                     # "--enable-prefix-caching",
-                    "--no-enable-prefix-caching",
+                    # "--no-enable-prefix-caching",
 
                     "--max-num-seqs",
                     str(max_seq_num),
 
          
-                    # "--num-scheduler-steps",
-                    # str(num_scheduler_steps),
+                    "--num-scheduler-steps",
+                    str(num_scheduler_steps),
+
                     "--served-model-name",
                     "trial",
-                    "--dtype",
-                    "half"
+                    # "--dtype", # Not needed on newer GPUs
+                    # "half"
                     ],
                 # executable="vllm",
                 env= dict(os.environ).update({
-                    # "VLLM_ATTENTION_BACKEND":"FLASH_ATTN"
+                    "VLLM_ATTENTION_BACKEND":"FLASH_ATTN" # Possibly a way to also compare across Attention backends
                 }),
                 stdout=f,
                 stderr=f,
@@ -265,57 +266,62 @@ def objective(trial : optuna.Trial):
         with open(config_file_path, "w+") as config_file:
             yaml.dump(load_test_config, config_file)
 
-        with open(log_file_path + "_load-test", "a") as log_file:
-            log_file.write("Starting Load Test with Config : " + config_file_path + "\n")
-            # Run the load test
-            load_test_proc = subprocess.Popen(
-                
-                args=" ".join([
-                    # Ensure that the python executable is correct. If using a llm-load-test ghcr container, 
-                    # the default python executable should have all the dependencies installed
-                    "ulimit -n 8192 &&",
-                    os.path.join(LLM_LOAD_TEST_HOME, "venv", "bin", "python"),
-                    "load_test.py",
-                    "-c",
-                    config_file_path
-                ]),
-                cwd=LLM_LOAD_TEST_HOME,
-                stdout=log_file,
-                stderr=log_file,
-                shell=True # TODO: Move at least llm-load-test to containers to avoid the too many files open error for failed tests
-            )
-            # Wait for the load test to finish - 1.2x the duration to allow for the trailing requests to finish
-            # Removing the timeout for now since llm-load-test cannot exit in time when there are too many requests trailing
-            # This can be partly resolved by preemption detection but that is not implemented yet
-            # TODO: Consider the condition of what happens when the performance is just too low and there are too many trailing requests without any preemption on the server side
-            load_test_proc.wait(timeout=load_test_config["load_options"]["duration"] * (1 + MAX_TRAILING_REQUEST_ALLOWANCE) + 20)
-            print("Load Test Finished")
-            # Kill the load test process if not finished
-            if load_test_proc.poll() is None:
-                load_test_proc.kill()
-                print("Killed Load Test")
-
-        # Read the output file
-        load_test_summary = read_llm_load_test_summary(os.path.join(load_test_config["output"]["dir"], f"output-{str(load_test_config["load_options"]["concurrency"]).zfill(3)}.json"))
-
-        # Get throughput and latency
-        throughput = load_test_summary["throughput"]
-        itl_median = load_test_summary["itl"]["median"]
-
-        # Score the metric
-        # score = score_metric(throughput, itl_median)
-        # score = score_metric_v4(throughput, itl_median)
-
-        # Waiting for vLLM to timeout or finish
         try:
-            print("Trying to comm 1")
-            # Max Trailing Request Allowance
-            out, errs = vllm_proc.communicate(timeout=load_test_config["load_options"]["duration"] * 0.1)
-            # proc.wait(MAX_SINGLE_TEST_DURATION)
-            print("commed 1")
-            print("Kill sent")
-        except subprocess.TimeoutExpired:
-            # out, errs = proc.communicate()
+
+            with open(log_file_path + "_load-test", "a") as log_file:
+                log_file.write("Starting Load Test with Config : " + config_file_path + "\n")
+                # Run the load test
+                load_test_proc = subprocess.Popen(
+
+                    args=" ".join([
+                        # Ensure that the python executable is correct. If using a llm-load-test ghcr container, 
+                        # the default python executable should have all the dependencies installed
+                        "ulimit -n 8192 &&",
+                        os.path.join(LLM_LOAD_TEST_HOME, "venv", "bin", "python"),
+                        "load_test.py",
+                        "-c",
+                        config_file_path
+                    ]),
+                    cwd=LLM_LOAD_TEST_HOME,
+                    stdout=log_file,
+                    stderr=log_file,
+                    shell=True # TODO: Move at least llm-load-test to containers to avoid the too many files open error for failed tests
+                )
+                # Wait for the load test to finish - 1.2x the duration to allow for the trailing requests to finish
+                # Removing the timeout for now since llm-load-test cannot exit in time when there are too many requests trailing
+                # This can be partly resolved by preemption detection but that is not implemented yet
+                # TODO: Consider the condition of what happens when the performance is just too low and there are too many trailing requests without any preemption on the server side
+                load_test_proc.wait(timeout=load_test_config["load_options"]["duration"] * (1 + MAX_TRAILING_REQUEST_ALLOWANCE) + 20)
+                print("Load Test Finished")
+                # Kill the load test process if not finished
+                if load_test_proc.poll() is None:
+                    load_test_proc.kill()
+                    print("Killed Load Test")
+
+            # Read the output file
+            load_test_summary = read_llm_load_test_summary(os.path.join(load_test_config["output"]["dir"], f"output-{str(load_test_config["load_options"]["concurrency"]).zfill(3)}.json"))
+
+            # Get throughput and latency
+            throughput = load_test_summary["throughput"]
+            itl_median = load_test_summary["itl"]["median"]
+
+            # Score the metric
+            # score = score_metric(throughput, itl_median)
+            # score = score_metric_v4(throughput, itl_median)
+
+            # Waiting for vLLM to timeout or finish
+            try:
+                print("Trying to comm 1")
+                # Max Trailing Request Allowance
+                out, errs = vllm_proc.communicate(timeout=load_test_config["load_options"]["duration"] * 0.1)
+                # proc.wait(MAX_SINGLE_TEST_DURATION)
+                print("commed 1")
+                print("Kill sent")
+            except subprocess.TimeoutExpired:
+                # out, errs = proc.communicate()
+                vllm_proc.send_signal(sig=signal.SIGINT)
+        finally:
+            load_test_proc.send_signal(sig=signal.SIGKILL)
             vllm_proc.send_signal(sig=signal.SIGINT)
             
             print("Communicated")
@@ -372,11 +378,12 @@ study.set_user_attr("gpu_memory", gpu_properties.total_memory)
 # TODO: Investigate if vLLM telemetry can be used to optimize the model - How to do this ? (Not talking about the prometheus metrics)
     # Check if Preemption events are transmitted - Yes. It's available in the prometheus metrics
 
+# TODO: Identify if any of the tunables have affinities to certain values. Eg: Is there a performance benefit to 
 
 # Why not use the existing Kruize org repos for this ? - They only seem to run the experiments and want manual intervention for the optimization (Choosing if the experiment was good or not)
 # This means it's easier to do subjective optimization but harder to do automated optimization
 
-study.optimize(objective, show_progress_bar=True, n_trials=20)
+study.optimize(objective, show_progress_bar=True, n_trials=50)
 
 # study.trials_dataframe().to_csv("/tmp/vllm-tune/study.csv")
 trials = sorted(study.best_trials, key = lambda trial: trial.values)
