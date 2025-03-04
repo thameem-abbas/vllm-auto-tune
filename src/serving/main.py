@@ -1,17 +1,11 @@
 import signal
-import vllm
 import time
 
 import optuna
-import random
 import os
 import subprocess
 from subprocess import STDOUT, check_output
 import json
-import vllm.entrypoints
-import vllm.entrypoints.openai
-import vllm.entrypoints.openai.api_server
-import vllm.entrypoints.openai.cli_args
 import yaml
 import requests
 import warnings
@@ -339,13 +333,27 @@ optuna.logging.get_logger("optuna").addHandler(logging.StreamHandler(sys.stdout)
 study_name = "vllm-tune-multi-objective-v2" # Will need to be made more discrete. Possibly identify code changes to ensure we're comparing apples to apples
 storage_name = f"sqlite:////tmp/vllm-tune/{study_name}.db" # Save more information to the RDB to be accessed later, resume if needed
 
-study = optuna.create_study(
-    directions=['maximize', 'minimize'],
-    study_name=study_name,
-    storage=storage_name,
-    load_if_exists=True,
-    sampler=optuna.samplers.NSGAIISampler()
-)
+# Grid Sampler Specs
+GRID_SAMPLER = False
+
+if GRID_SAMPLER:
+    # Load grid sampler_specs from yaml file
+    grid_sampler_specs = yaml.load(open("grid_sampler_specs.yaml"), Loader=yaml.FullLoader)
+    study = optuna.create_study(
+        directions=['maximize', 'minimize'],
+        study_name=study_name,
+        storage=storage_name,
+        load_if_exists=True,
+        sampler=optuna.samplers.GridSampler(grid_sampler_specs)
+    )
+else:
+    study = optuna.create_study(
+        directions=['maximize', 'minimize'],
+        study_name=study_name,
+        storage=storage_name,
+        load_if_exists=True,
+        sampler=optuna.samplers.NSGAIISampler()
+    )
 
 study.set_user_attr("study_start_time",datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))
 study.set_user_attr("log_folder_path", "/tmp/vllm-tune/logs")
