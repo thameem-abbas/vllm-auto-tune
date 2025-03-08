@@ -5,7 +5,7 @@ output:
 storage: # TODO
   type: local
 dataset:
-  file: "/root/thibrahi/vllm-auto-tune/llm-load-test/datasets/openorca_large_subset_011.jsonl"
+  file: "/home/ubuntu/thibrahi/vllm-auto-tune/llm-load-test/datasets/openorca_large_subset_011.jsonl"
   max_queries: 3000
   min_input_tokens: 0
   max_input_tokens: 512

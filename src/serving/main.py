@@ -14,12 +14,19 @@ import logging
 
 # LLM-load-test is currently not a package and will have to be invoked via the command line
 import sys
-LLM_LOAD_TEST_HOME = "/root/thibrahi/vllm-auto-tune/llm-load-test"
+LLM_LOAD_TEST_HOME = os.environ("LLM_LOAD_TEST_HOME")
+if LLM_LOAD_TEST_HOME is None:
+    raise RuntimeError("Set LLM_LOAD_TEST_HOME !!!")
 sys.path.append(LLM_LOAD_TEST_HOME)
+
+BASE_CONFIG = os.environ("BASE_CONFIG_PATH")
+if not os.path.exists(BASE_CONFIG):
+    raise RuntimeError("Base config missing")
 
 MAX_SINGLE_TEST_DURATION = 500
 MAX_TRAILING_REQUEST_ALLOWANCE = 0.2
 ITL_MEDIAN_CEILING = 25
+MAX_NUM_TRIALS = 30
 
 def read_llm_load_test_summary(filepath):
     if not os.path.exists(filepath):
@@ -139,21 +146,28 @@ def objective(trial : optuna.Trial):
     log_folder_path = trial.study.user_attrs["log_folder_path"] if "log_folder_path" in trial.study.user_attrs else "/tmp/vllm-tune/logs"
     artifacts_dir = trial.study.user_attrs["artifacts_dir"] if "artifacts_dir" in trial.study.user_attrs else "/tmp/vllm-tune/artifacts"
 
+    VLLM_ATTENTION_BACKEND = "FLASH_ATTN"
+
     # Parameter Suggestions
 
     # enable_chunked_prefill = trial.suggest_categorical(
-        # "chunked_prefill",
-        # choices=[True, False]
+    #     "chunked_prefill",
+    #     choices=[True, False]
     # )
 
-    num_scheduler_steps = trial.suggest_int("num-multi-steps", low=1, high=10, step=1)
+    num_scheduler_steps = trial.suggest_int("num_multi_steps", low=1, high=10, step=1)
 
     block_size = trial.suggest_categorical(
         "block_size",
         # choices=[8,16,32] # Opt250m doesn't support 64 and 128
-        choices=[8,16,32,64,128]
+        choices=[8,16,32,64,128] if VLLM_ATTENTION_BACKEND != "FLASH_ATTN" else [16, 32]
         # choices=[8]
         )
+    
+    # Pruning trials is meant as a way to do away with unpromising trials 
+    # -> To use when we know that we have steady state but the throughput is definitely bad
+    # -> To use when we observe pre-emption events
+    # Cannot be used to enforce parameter subspace
 
     # Concurrency
     concurrency = trial.suggest_int("concurrency", low=32, high=256, step=4) # Step size of 4 to reduce the number of possible trials
@@ -242,7 +256,7 @@ def objective(trial : optuna.Trial):
 
         # llm-load-test
         # Using a base config file
-        load_test_config = yaml.load(open("base_config.yaml"), Loader=yaml.FullLoader)
+        load_test_config = yaml.load(open(BASE_CONFIG), Loader=yaml.FullLoader)
         # Parameters to be overwritten
         # Output dir
         # Load Options - Duration
@@ -330,7 +344,7 @@ def objective(trial : optuna.Trial):
     return multi_objective_score_v2(throughput, itl_median)
 
 optuna.logging.get_logger("optuna").addHandler(logging.StreamHandler(sys.stdout))
-study_name = "vllm-tune-multi-objective-v2" # Will need to be made more discrete. Possibly identify code changes to ensure we're comparing apples to apples
+study_name = "vllm-tune-multi-objective-non-grid-sampler-v2" # Will need to be made more discrete. Possibly identify code changes to ensure we're comparing apples to apples
 storage_name = f"sqlite:////tmp/vllm-tune/{study_name}.db" # Save more information to the RDB to be accessed later, resume if needed
 
 # Grid Sampler Specs
@@ -390,8 +404,12 @@ study.set_user_attr("gpu_memory", gpu_properties.total_memory)
 
 # Why not use the existing Kruize org repos for this ? - They only seem to run the experiments and want manual intervention for the optimization (Choosing if the experiment was good or not)
 # This means it's easier to do subjective optimization but harder to do automated optimization
+if GRID_SAMPLER:
+    NUM_TRIALS = None
+else:
+    NUM_TRIALS = MAX_NUM_TRIALS
 
-study.optimize(objective, show_progress_bar=True, n_trials=50)
+study.optimize(objective, show_progress_bar=True, n_trials=NUM_TRIALS)
 
 # study.trials_dataframe().to_csv("/tmp/vllm-tune/study.csv")
 trials = sorted(study.best_trials, key = lambda trial: trial.values)

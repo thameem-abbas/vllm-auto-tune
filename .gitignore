@@ -1,1 +1,5 @@
 venv/
+wrong_trials_backup
+*.tar
+*.log
+llama-32-3b-instruct

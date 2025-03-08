@@ -1,4 +1,3 @@
-params:
-  num-multi-step: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-  block-size: [8, 16, 32] # nvidia is supposed to support only up to 32
-  concurrency: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+num_multi_steps: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+block_size: [16, 32] # nvidia is supposed to support only up to 32. Flash Attention can only support block sizes in multiples of 16
+concurrency: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
