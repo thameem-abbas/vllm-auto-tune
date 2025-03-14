@@ -1,2 +1,5 @@
 vllm
 optuna
+pandas
+plotly
+seaborn
