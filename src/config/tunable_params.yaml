@@ -1,0 +1,93 @@
+# vLLM Tunable Parameters Configuration
+# Each parameter can be enabled/disabled for tuning and has its own configuration
+
+parameters:
+  block_size:
+    enabled: true
+    type: categorical
+    choices: [8, 16, 32, 64, 128]
+    description: "Block size for KV cache"
+    default: 16
+
+  num_scheduler_steps:
+    enabled: true
+    type: int
+    range:
+      low: 1
+      high: 10
+      step: 1
+    description: "Number of scheduler steps"
+    default: 1
+
+  max_model_len:
+    enabled: false  # Not tuning this for now
+    type: int
+    range:
+      low: 1024
+      high: 4096
+      step: 512
+    description: "Maximum model length"
+    default: 2048
+
+  concurrency:
+    enabled: true
+    type: int
+    range:
+      low: 32
+      high: 256
+      step: 4
+    description: "Number of concurrent requests"
+    default: 64
+
+  enable_chunked_prefill:
+    enabled: false  # Not tuning this for now
+    type: categorical
+    choices: [true, false]
+    description: "Enable chunked prefill"
+    default: false
+
+  enable_prefix_caching:
+    enabled: false  # Not tuning this for now
+    type: categorical
+    choices: [true, false]
+    description: "Enable prefix caching"
+    default: false
+
+  max_num_seqs:
+    enabled: false  # This is derived from concurrency
+    type: int
+    description: "Maximum number of sequences (derived from concurrency)"
+    derived_from: "concurrency"
+    derivation: "next_power_of_2"
+
+  dtype:
+    enabled: false  # Not tuning this for now
+    type: categorical
+    choices: ["float16", "bfloat16"]
+    description: "Model data type"
+    default: "float16"
+
+# Global optimization settings
+optimization:
+  study_name: "vllm-tune-multi-objective-non-grid-sampler-v2"
+  storage: "sqlite:////tmp/vllm-tune/{study_name}.db"
+  max_trials: 30
+  directions:
+    - maximize  # throughput
+    - minimize  # itl_penalty
+  sampler: "NSGAII"  # Options: NSGAII, Grid
+  grid_sampler_specs: null  # Path to grid sampler specs if using grid sampler
+
+# Model settings
+model:
+  path: "/home/ubuntu/thibrahi/vllm-auto-tune/llama-32-3b-instruct"
+  attention_backend: "FLASH_ATTN"
+  served_model_name: "trial"
+
+# Test settings
+test:
+  duration: 60
+  max_trailing_request_allowance: 0.2
+  itl_median_ceiling: 25
+  health_check_url: "http://0.0.0.0:8000/health"
+  launch_wait_time: 60 

@@ -138,287 +138,90 @@ def multi_objective_score_v2(throughput, itl_median):
 def get_next_max_concurrency_limit(concurrency):
     return 2 ** (concurrency.bit_length())
 
+from src.config.settings import (
+    STUDY_NAME, STORAGE_NAME, MAX_NUM_TRIALS,
+    LOG_FOLDER_PATH, ARTIFACTS_DIR
+)
+from src.core.objective import multi_objective_score_v2, get_next_max_concurrency_limit
+from src.core.optimization import (
+    create_study, setup_logging, save_study_results, print_best_trials, suggest_trial_params
+)
+from src.serving.server import VLLMServer
+from src.serving.load_test import LoadTester
+from src.utils.file_utils import make_file_name
+from src.config.param_manager import TunableParamManager
 
-def objective(trial : optuna.Trial):
-
-    # User Attributes
+def objective(trial: optuna.Trial, param_manager: TunableParamManager):
+    """Optuna objective function for optimizing vLLM parameters."""
+    # Get study attributes
     study_start_time = trial.study.user_attrs["study_start_time"]
-    log_folder_path = trial.study.user_attrs["log_folder_path"] if "log_folder_path" in trial.study.user_attrs else "/tmp/vllm-tune/logs"
-    artifacts_dir = trial.study.user_attrs["artifacts_dir"] if "artifacts_dir" in trial.study.user_attrs else "/tmp/vllm-tune/artifacts"
+    log_folder_path = trial.study.user_attrs["log_folder_path"]
+    artifacts_dir = trial.study.user_attrs["artifacts_dir"]
 
-    VLLM_ATTENTION_BACKEND = "FLASH_ATTN"
+    # Get parameters for this trial
+    params = suggest_trial_params(trial, param_manager)
 
-    # Parameter Suggestions
+    # Setup paths
+    trial_log_dir = os.path.join(log_folder_path, trial.study.study_name, study_start_time)
+    os.makedirs(trial_log_dir, exist_ok=True)
+    log_file_path = os.path.join(trial_log_dir, make_file_name("trial_", params, ".log"))
 
-    # enable_chunked_prefill = trial.suggest_categorical(
-    #     "chunked_prefill",
-    #     choices=[True, False]
-    # )
+    # Initialize server and load tester
+    server = VLLMServer(log_file_path, param_manager)
+    load_tester = LoadTester(artifacts_dir, trial.study.study_name, study_start_time)
 
-    num_scheduler_steps = trial.suggest_int("num_multi_steps", low=1, high=10, step=1)
+    try:
+        # Start vLLM server
+        if not server.start(params):
+            return 1
 
-    block_size = trial.suggest_categorical(
-        "block_size",
-        # choices=[8,16,32] # Opt250m doesn't support 64 and 128
-        choices=[8,16,32,64,128] if VLLM_ATTENTION_BACKEND != "FLASH_ATTN" else [16, 32]
-        # choices=[8]
-        )
-    
-    # Pruning trials is meant as a way to do away with unpromising trials 
-    # -> To use when we know that we have steady state but the throughput is definitely bad
-    # -> To use when we observe pre-emption events
-    # Cannot be used to enforce parameter subspace
+        # Prepare and run load test
+        _, config_file_path = load_tester.prepare_config(params, params['concurrency'])
+        load_test_results = load_tester.run_load_test(config_file_path, log_file_path)
 
-    # Concurrency
-    concurrency = trial.suggest_int("concurrency", low=32, high=256, step=4) # Step size of 4 to reduce the number of possible trials
-    max_seq_num = get_next_max_concurrency_limit(concurrency)
+        if load_test_results is None:
+            return 1
 
-    log_folder_path = os.path.join(log_folder_path, trial.study.study_name, study_start_time) 
-    if not os.path.exists(log_folder_path):
-        os.makedirs(log_folder_path)
+        # Get metrics
+        throughput = load_test_results["throughput"]
+        itl_median = load_test_results["itl"]["median"]
 
-    log_file_path = os.path.join(log_folder_path, make_file_name("trial_", trial.params, ".log"))
-
-    # Launch vLLM as a subprocess
-    with open(log_file_path, "w+") as f:
-
-        # Kinda invasive and can break anytime that vLLM chooses to update their 
-        # entrypoints
-        # args = {}
-        # if not vllm.entrypoints.openai.cli_args.validate_parsed_serve_args(args):
-        #     raise RuntimeError("Invalid args")
-
-        # vllm.entrypoints.openai.api_server.run_server(
-        #     args=args
-        # )
-        
-        vllm_proc = subprocess.Popen(
-                args=[
-                    "vllm",
-                    "serve",
-                    # "/mnt/data/models/Llama-3.2-3B",
-                    # "/mnt/data/models/opt250m",
-                    "/home/ubuntu/thibrahi/vllm-auto-tune/llama-32-3b-instruct",
-
-                    "--max-model-len",
-                    "2048",
-                    
-                    "--block-size",
-                    str(block_size),
-                    
-                    # "--enable_chunked_prefill",
-                    # str(enable_chunked_prefill).lower(),
-                    # "false",
-
-                    # "--enable-prefix-caching",
-                    # "--no-enable-prefix-caching",
-
-                    "--max-num-seqs",
-                    str(max_seq_num),
-
-         
-                    "--num-scheduler-steps",
-                    str(num_scheduler_steps),
-
-                    "--served-model-name",
-                    "trial",
-                    # "--dtype", # Not needed on newer GPUs
-                    # "half"
-                    ],
-                # executable="vllm",
-                env= dict(os.environ).update({
-                    "VLLM_ATTENTION_BACKEND":"FLASH_ATTN" # Possibly a way to also compare across Attention backends
-                }),
-                stdout=f,
-                stderr=f,
-                stdin=subprocess.PIPE,
-                text=True
-            )
-        print("Done Starting process")
-
-        # Wait until the health check becomes available
-        LAUNCH_WAIT_TIME = 60
-        start_time = time.time()
-        while True:
-            if check_vllm_health():
-                break
-            if time.time() - start_time > LAUNCH_WAIT_TIME:
-                warnings.warn("vLLM did not start in time")
-                vllm_proc.terminate()
-                return 1
-            if check_log_for_errors(log_file_path):
-                warnings.warn("vLLM did not start successfully. Check logs for errors : " + os.path.join(log_folder_path, make_file_name("trial_", trial.params, ".log")))
-                vllm_proc.terminate()
-                return 1
-            time.sleep(1)
-
-        print("Health Check Passed")
-
-        # llm-load-test
-        # Using a base config file
-        load_test_config = yaml.load(open(BASE_CONFIG), Loader=yaml.FullLoader)
-        # Parameters to be overwritten
-        # Output dir
-        # Load Options - Duration
-        # Load Options - Concurrencies
-
-        # Might make it flat with the output dir being the same and the output file name being different per trial
-        load_test_config["output"]["dir"] = os.path.join(artifacts_dir, trial.study.study_name, study_start_time, make_file_name("output_", trial.params))
-        if not os.path.exists(load_test_config["output"]["dir"]):
-            os.makedirs(load_test_config["output"]["dir"])
-        load_test_config["load_options"]["duration"] = 60 # TODO: Need a way to identify steady state
-        load_test_config["load_options"]["concurrency"] = concurrency
-
-        # Write the config file to tmp with a random ID
-        config_file_path = os.path.join(artifacts_dir, trial.study.study_name, study_start_time, make_file_name("config_", trial.params, ".yaml"))
-        with open(config_file_path, "w+") as config_file:
-            yaml.dump(load_test_config, config_file)
-
-        try:
-
-            with open(log_file_path + "_load-test", "a") as log_file:
-                log_file.write("Starting Load Test with Config : " + config_file_path + "\n")
-                # Run the load test
-                load_test_proc = subprocess.Popen(
-
-                    args=" ".join([
-                        # Ensure that the python executable is correct. If using a llm-load-test ghcr container, 
-                        # the default python executable should have all the dependencies installed
-                        "ulimit -n 8192 &&",
-                        os.path.join(LLM_LOAD_TEST_HOME, "venv", "bin", "python"),
-                        "load_test.py",
-                        "-c",
-                        config_file_path
-                    ]),
-                    cwd=LLM_LOAD_TEST_HOME,
-                    stdout=log_file,
-                    stderr=log_file,
-                    shell=True # TODO: Move at least llm-load-test to containers to avoid the too many files open error for failed tests
-                )
-                # Wait for the load test to finish - 1.2x the duration to allow for the trailing requests to finish
-                # Removing the timeout for now since llm-load-test cannot exit in time when there are too many requests trailing
-                # This can be partly resolved by preemption detection but that is not implemented yet
-                # TODO: Consider the condition of what happens when the performance is just too low and there are too many trailing requests without any preemption on the server side
-                load_test_proc.wait(timeout=load_test_config["load_options"]["duration"] * (1 + MAX_TRAILING_REQUEST_ALLOWANCE) + 20)
-                print("Load Test Finished")
-                # Kill the load test process if not finished
-                if load_test_proc.poll() is None:
-                    load_test_proc.kill()
-                    print("Killed Load Test")
-
-            # Read the output file
-            load_test_summary = read_llm_load_test_summary(os.path.join(load_test_config["output"]["dir"], f"output-{str(load_test_config["load_options"]["concurrency"]).zfill(3)}.json"))
-
-            # Get throughput and latency
-            throughput = load_test_summary["throughput"]
-            itl_median = load_test_summary["itl"]["median"]
-
-            # Score the metric
-            # score = score_metric(throughput, itl_median)
-            # score = score_metric_v4(throughput, itl_median)
-
-            # Waiting for vLLM to timeout or finish
-            try:
-                print("Trying to comm 1")
-                # Max Trailing Request Allowance
-                out, errs = vllm_proc.communicate(timeout=load_test_config["load_options"]["duration"] * 0.1)
-                # proc.wait(MAX_SINGLE_TEST_DURATION)
-                print("commed 1")
-                print("Kill sent")
-            except subprocess.TimeoutExpired:
-                # out, errs = proc.communicate()
-                vllm_proc.send_signal(sig=signal.SIGINT)
-        finally:
-            load_test_proc.send_signal(sig=signal.SIGKILL)
-            vllm_proc.send_signal(sig=signal.SIGINT)
-            
-            print("Communicated")
-        print("Try Except Out")
-
+        # Set trial attributes
         trial.set_user_attr("throughput", throughput)
         trial.set_user_attr("itl_median", itl_median)
         trial.set_user_attr("config_file_path", config_file_path)
 
-        # f.write(out)
+        return multi_objective_score_v2(throughput, itl_median)
 
-    return multi_objective_score_v2(throughput, itl_median)
+    finally:
+        # Cleanup
+        load_tester.terminate()
+        server.terminate()
 
-optuna.logging.get_logger("optuna").addHandler(logging.StreamHandler(sys.stdout))
-study_name = "vllm-tune-multi-objective-non-grid-sampler-v2" # Will need to be made more discrete. Possibly identify code changes to ensure we're comparing apples to apples
-storage_name = f"sqlite:////tmp/vllm-tune/{study_name}.db" # Save more information to the RDB to be accessed later, resume if needed
+def main():
+    """Main entry point for the optimization process."""
+    # Initialize parameter manager
+    param_manager = TunableParamManager("src/config/tunable_params.yaml")
+    
+    # Setup logging
+    setup_logging()
 
-# Grid Sampler Specs
-GRID_SAMPLER = False
+    # Create study
+    study = create_study(param_manager)
 
-if GRID_SAMPLER:
-    # Load grid sampler_specs from yaml file
-    grid_sampler_specs = yaml.load(open("grid_sampler_specs.yaml"), Loader=yaml.FullLoader)
-    study = optuna.create_study(
-        directions=['maximize', 'minimize'],
-        study_name=study_name,
-        storage=storage_name,
-        load_if_exists=True,
-        sampler=optuna.samplers.GridSampler(grid_sampler_specs)
-    )
-else:
-    study = optuna.create_study(
-        directions=['maximize', 'minimize'],
-        study_name=study_name,
-        storage=storage_name,
-        load_if_exists=True,
-        sampler=optuna.samplers.NSGAIISampler()
+    # Get optimization config
+    opt_config = param_manager.get_optimization_config()
+
+    # Run optimization
+    study.optimize(
+        lambda trial: objective(trial, param_manager),
+        show_progress_bar=True,
+        n_trials=opt_config['max_trials']
     )
 
-study.set_user_attr("study_start_time",datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))
-study.set_user_attr("log_folder_path", "/tmp/vllm-tune/logs")
-study.set_user_attr("artifacts_dir", "/tmp/vllm-tune/artifacts")
+    # Save and print results
+    save_study_results(study, f"/tmp/vllm-tune/{opt_config['study_name']}.csv")
+    print_best_trials(study)
 
-# Get GPU Properties
-# TODO: Extend to Multi-GPU Scenario
-import torch
-gpu_properties = torch.cuda.get_device_properties(0)
-study.set_user_attr("gpu_name", gpu_properties.name)
-study.set_user_attr("gpu_memory", gpu_properties.total_memory)
-        
-
-# Cannot run more than one job at this time
-# TODO: GPU Indexing for parallelizing the trials
-# TODO: CLI Output parsing to remove dependency on setting up yaml files
-# TODO: Multi objective Optimization
-# TODO: Constrained Optimization
-# TODO: Logging and Monitoring
-# TODO: Central Storage for experiments
-# TODO: Central Storage for logs and artifacts
-# TODO: Custom callback to monitor and stop the study if the optimizations are not making any further improvements
-# TODO: Figure out a way to organize the whole thing. Not a code task
-# TODO: A way to rapidly reach steady state ? - How to do this ?
-# TODO: Add explanation of how to add good starting points for the optimization - Suggested Trials
-# TODO: We don't Add KV Cache usage for the optimization. Rather we prune the trials where preemption happens. 
-    # This can potentially be handled inside of this automation alone. 
-    # This should avoid any bias towards higher KV Cache space util and will focus purely on throughput
-
-# TODO: Investigate if vLLM telemetry can be used to optimize the model - How to do this ? (Not talking about the prometheus metrics)
-    # Check if Preemption events are transmitted - Yes. It's available in the prometheus metrics
-
-# TODO: Identify if any of the tunables have affinities to certain values. Eg: Is there a performance benefit to 
-
-# Why not use the existing Kruize org repos for this ? - They only seem to run the experiments and want manual intervention for the optimization (Choosing if the experiment was good or not)
-# This means it's easier to do subjective optimization but harder to do automated optimization
-if GRID_SAMPLER:
-    NUM_TRIALS = None
-else:
-    NUM_TRIALS = MAX_NUM_TRIALS
-
-study.optimize(objective, show_progress_bar=True, n_trials=NUM_TRIALS)
-
-# study.trials_dataframe().to_csv("/tmp/vllm-tune/study.csv")
-trials = sorted(study.best_trials, key = lambda trial: trial.values)
-print("Best Trials : ")
-for trial in trials:
-    print("Trial : ", trial.number)
-    print("Params : ", trial.params)
-    print("Value : ", trial.values)
-    print("Attributes : ", trial.user_attrs)
-    print("Intermediate Values : ", trial.intermediate_values)
-    print("Datetime : ", trial.datetime_start)
-study.trials_dataframe().to_csv("/tmp/vllm-tune/multi-objective-study.csv")
+if __name__ == "__main__":
+    main()
